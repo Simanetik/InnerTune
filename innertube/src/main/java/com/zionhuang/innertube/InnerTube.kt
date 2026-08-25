@@ -82,12 +82,10 @@ class InnerTube {
         contentType(ContentType.Application.Json)
         headers {
             append("X-Goog-Api-Format-Version", "1")
-            append("X-YouTube-Client-Name", client.clientName)
+            append("X-YouTube-Client-Name", client.clientId)
             append("X-YouTube-Client-Version", client.clientVersion)
-            append("x-origin", "https://music.youtube.com")
-            if (client.referer != null) {
-                append("Referer", client.referer)
-            }
+            append("X-Origin", "https://music.youtube.com")
+            append("Referer", "https://music.youtube.com/")
             if (setLogin) {
                 cookie?.let { cookie ->
                     append("cookie", cookie)
@@ -99,7 +97,6 @@ class InnerTube {
             }
         }
         userAgent(client.userAgent)
-        parameter("key", client.api_key)
         parameter("prettyPrint", false)
     }
 
@@ -226,10 +223,8 @@ class InnerTube {
         client: YouTubeClient,
         videoId: String,
     ) = httpClient.post("https://music.youtube.com/youtubei/v1/get_transcript") {
-        parameter("key", "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX3")
-        headers {
-            append("Content-Type", "application/json")
-        }
+        ytClient(client)
+        parameter("prettyPrint", false)
         setBody(
             GetTranscriptBody(
                 context = client.toContext(locale, null),

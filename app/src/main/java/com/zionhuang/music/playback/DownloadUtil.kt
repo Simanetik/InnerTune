@@ -14,6 +14,7 @@ import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadNotificationHelper
 import com.zionhuang.innertube.YouTube
+import com.zionhuang.innertube.models.YouTubeClient
 import com.zionhuang.music.constants.AudioQuality
 import com.zionhuang.music.constants.AudioQualityKey
 import com.zionhuang.music.db.MusicDatabase
@@ -53,7 +54,7 @@ class DownloadUtil @Inject constructor(
                     OkHttpClient.Builder()
                         .proxy(YouTube.proxy)
                         .build()
-                )
+                ).setUserAgent(YouTubeClient.ANDROID_VR.userAgent)
             )
     ) { dataSpec ->
         val mediaId = dataSpec.key ?: error("No media id")
@@ -63,7 +64,7 @@ class DownloadUtil @Inject constructor(
             return@Factory dataSpec
         }
 
-        songUrlCache[mediaId]?.takeIf { it.second < System.currentTimeMillis() }?.let {
+        songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
             return@Factory dataSpec.withUri(it.first.toUri())
         }
 
@@ -72,7 +73,11 @@ class DownloadUtil @Inject constructor(
             YouTube.player(mediaId)
         }.getOrThrow()
         if (playerResponse.playabilityStatus.status != "OK") {
-            throw PlaybackException(playerResponse.playabilityStatus.reason, null, PlaybackException.ERROR_CODE_REMOTE_ERROR)
+            throw PlaybackException(
+                playerResponse.playabilityStatus.reason ?: "Playback blocked (status: ${playerResponse.playabilityStatus.status})",
+                null,
+                PlaybackException.ERROR_CODE_REMOTE_ERROR
+            )
         }
 
         val format =
@@ -108,7 +113,7 @@ class DownloadUtil @Inject constructor(
             )
         }
 
-        songUrlCache[mediaId] = format.url!! to playerResponse.streamingData!!.expiresInSeconds * 1000L
+        songUrlCache[mediaId] = format.url!! to (System.currentTimeMillis() + playerResponse.streamingData!!.expiresInSeconds * 1000L)
         dataSpec.withUri(format.url!!.toUri())
     }
     val downloadNotificationHelper = DownloadNotificationHelper(context, ExoDownloadService.CHANNEL_ID)

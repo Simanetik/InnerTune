@@ -1,5 +1,6 @@
 package com.zionhuang.music.playback
 
+import android.util.Log
 import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
@@ -53,6 +54,7 @@ import com.google.common.util.concurrent.MoreExecutors
 import com.zionhuang.innertube.YouTube
 import com.zionhuang.innertube.models.SongItem
 import com.zionhuang.innertube.models.WatchEndpoint
+import com.zionhuang.innertube.models.YouTubeClient
 import com.zionhuang.innertube.models.response.PlayerResponse
 import com.zionhuang.music.MainActivity
 import com.zionhuang.music.R
@@ -588,6 +590,13 @@ class MusicService : MediaLibraryService(),
     }
 
     override fun onPlayerError(error: PlaybackException) {
+        Log.e("InnerTuneDebug", "onPlayerError: code=${error.errorCode} message=${error.message}", error)
+        error.cause?.let { cause ->
+            Log.e("InnerTuneDebug", "  cause: ${cause.javaClass.simpleName}: ${cause.message}")
+            cause.cause?.let { inner ->
+                Log.e("InnerTuneDebug", "  inner cause: ${inner.javaClass.simpleName}: ${inner.message}")
+            }
+        }
         if (dataStore.get(AutoSkipNextOnErrorKey, false) &&
             isInternetAvailable(this) &&
             player.hasNextMediaItem()
@@ -611,7 +620,7 @@ class MusicService : MediaLibraryService(),
                                 OkHttpClient.Builder()
                                     .proxy(YouTube.proxy)
                                     .build()
-                            )
+                            ).setUserAgent(YouTubeClient.ANDROID_VR.userAgent)
                         )
                     )
             )
@@ -623,24 +632,33 @@ class MusicService : MediaLibraryService(),
         return ResolvingDataSource.Factory(createCacheDataSource()) { dataSpec ->
             val mediaId = dataSpec.key ?: error("No media id")
 
+            Log.d("InnerTuneDebug", "=== Resolving chunk for $mediaId pos=${dataSpec.position} len=${dataSpec.length} ===")
+
             if (downloadCache.isCached(mediaId, dataSpec.position, if (dataSpec.length >= 0) dataSpec.length else 1) ||
                 playerCache.isCached(mediaId, dataSpec.position, CHUNK_LENGTH)
             ) {
+                Log.d("InnerTuneDebug", "[$mediaId] Serving from cache (pos=${dataSpec.position})")
                 scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
                 return@Factory dataSpec
             }
 
-            songUrlCache[mediaId]?.takeIf { it.second < System.currentTimeMillis() }?.let {
-                scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
-                return@Factory dataSpec.withUri(it.first.toUri())
-            }
+            songUrlCache[mediaId]?.let { cached ->
+                val remainingMs = cached.second - System.currentTimeMillis()
+                Log.d("InnerTuneDebug", "[$mediaId] URL cache: expires in ${remainingMs / 1000}s, valid=${remainingMs > 0}")
+                if (remainingMs > 0) {
+                    scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
+                    return@Factory dataSpec.withUri(cached.first.toUri())
+                }
+            } ?: Log.d("InnerTuneDebug", "[$mediaId] No URL in cache, fetching from API")
 
             // Check whether format exists so that users from older version can view format details
             // There may be inconsistent between the downloaded file and the displayed info if user change audio quality frequently
             val playedFormat = runBlocking(Dispatchers.IO) { database.format(mediaId).first() }
+            Log.d("InnerTuneDebug", "[$mediaId] Calling YouTube.player()...")
             val playerResponse = runBlocking(Dispatchers.IO) {
                 YouTube.player(mediaId)
             }.getOrElse { throwable ->
+                Log.e("InnerTuneDebug", "[$mediaId] YouTube.player() FAILED: ${throwable.javaClass.simpleName}: ${throwable.message}", throwable)
                 when (throwable) {
                     is ConnectException, is UnknownHostException -> {
                         throw PlaybackException(getString(R.string.error_no_internet), throwable, PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED)
@@ -650,11 +668,22 @@ class MusicService : MediaLibraryService(),
                         throw PlaybackException(getString(R.string.error_timeout), throwable, PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT)
                     }
 
-                    else -> throw PlaybackException(getString(R.string.error_unknown), throwable, PlaybackException.ERROR_CODE_REMOTE_ERROR)
+                    else -> throw PlaybackException(throwable.message ?: getString(R.string.error_unknown), throwable, PlaybackException.ERROR_CODE_REMOTE_ERROR)
                 }
             }
+            Log.d("InnerTuneDebug", "[$mediaId] playabilityStatus=${playerResponse.playabilityStatus.status}, reason=${playerResponse.playabilityStatus.reason}")
             if (playerResponse.playabilityStatus.status != "OK") {
-                throw PlaybackException(playerResponse.playabilityStatus.reason, null, PlaybackException.ERROR_CODE_REMOTE_ERROR)
+                throw PlaybackException(
+                    playerResponse.playabilityStatus.reason ?: "Playback blocked (status: ${playerResponse.playabilityStatus.status})",
+                    null,
+                    PlaybackException.ERROR_CODE_REMOTE_ERROR
+                )
+            }
+
+            val streamingData = playerResponse.streamingData
+            Log.d("InnerTuneDebug", "[$mediaId] streamingData: formats=${streamingData?.formats?.size}, adaptiveFormats=${streamingData?.adaptiveFormats?.size}, expiresIn=${streamingData?.expiresInSeconds}s")
+            streamingData?.adaptiveFormats?.filter { it.isAudio }?.forEach {
+                Log.d("InnerTuneDebug", "[$mediaId]   audio format: itag=${it.itag} mime=${it.mimeType} bitrate=${it.bitrate} url=${if (it.url != null) "present (${it.url!!.take(80)}...)" else "NULL"}")
             }
 
             val format =
@@ -675,6 +704,8 @@ class MusicService : MediaLibraryService(),
                         }
                 } ?: throw PlaybackException(getString(R.string.error_no_stream), null, ERROR_CODE_NO_STREAM)
 
+            Log.d("InnerTuneDebug", "[$mediaId] Selected format: itag=${format.itag} mime=${format.mimeType} bitrate=${format.bitrate} contentLength=${format.contentLength} url=${if (format.url != null) "present" else "NULL"}")
+
             database.query {
                 upsert(
                     FormatEntity(
@@ -691,8 +722,11 @@ class MusicService : MediaLibraryService(),
             }
             scope.launch(Dispatchers.IO) { recoverSong(mediaId, playerResponse) }
 
-            songUrlCache[mediaId] = format.url!! to playerResponse.streamingData!!.expiresInSeconds * 1000L
-            dataSpec.withUri(format.url!!.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
+            val expiresInSeconds = playerResponse.streamingData!!.expiresInSeconds
+            val streamUrl = "${format.url!!}&range=0-${format.contentLength ?: 10000000}"
+            songUrlCache[mediaId] = streamUrl to (System.currentTimeMillis() + expiresInSeconds * 1000L)
+            Log.d("InnerTuneDebug", "[$mediaId] Cached URL (with range param), expires in ${expiresInSeconds}s. Serving chunk at offset=${dataSpec.uriPositionOffset}")
+            dataSpec.withUri(streamUrl.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
         }
     }
 
